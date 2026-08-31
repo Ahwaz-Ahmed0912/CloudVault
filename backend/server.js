@@ -7,9 +7,27 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { BlobServiceClient } from '@azure/storage-blob';
 import { initDB, query, queryOne } from './db.js';
 
 dotenv.config();
+
+// Azure Blob Storage configuration
+const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING || '';
+const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'cloudvault';
+
+let blobServiceClient = null;
+let containerClient = null;
+
+if (AZURE_STORAGE_CONNECTION_STRING) {
+  blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
+  containerClient = blobServiceClient.getContainerClient(AZURE_CONTAINER_NAME);
+  containerClient.createIfNotExists().then(() => {
+    console.log(`Azure Blob container "${AZURE_CONTAINER_NAME}" ready.`);
+  }).catch(err => {
+    console.error('Failed to create Azure Blob container:', err.message);
+  });
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,7 +37,8 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cloudvault_super_secret_key_9988';
 
 // Middlewares
-app.use(cors());
+const corsOrigin = process.env.CORS_ORIGIN || '*'; // In production, this should be set to the specific domain
+app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
 
 // Set up local file storage path
@@ -39,7 +58,20 @@ const storage = multer.diskStorage({
     cb(null, uniqueSuffix + path.extname(file.originalname));
   }
 });
-const upload = multer({ storage });
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB file size limit
+});
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    await query('SELECT 1'); // verify database connection
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    res.status(503).json({ status: 'error', database: 'disconnected', error: err.message });
+  }
+});
 
 // Helper to log user activities
 async function logActivity(userId, action, details, req) {
@@ -202,9 +234,16 @@ app.post('/api/auth/logout', (req, res) => {
 app.post('/api/files/upload', authenticateToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const { originalname, size, mimetype, filename } = req.file;
+  const { originalname, size, mimetype, filename, path: tempFilePath } = req.file;
 
   try {
+    // Upload to Azure if configured
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(filename);
+      await blockBlobClient.uploadFile(tempFilePath);
+      fs.unlinkSync(tempFilePath); // Delete local temp file
+    }
+
     const result = await query(
       'INSERT INTO files (user_id, name, size, type, path) VALUES (?, ?, ?, ?, ?)',
       [req.user.id, originalname, size, mimetype, filename]
@@ -223,7 +262,8 @@ app.post('/api/files/upload', authenticateToken, upload.single('file'), async (r
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Database save failed' });
+    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
@@ -275,16 +315,26 @@ app.get('/api/files/:id/download', authenticateToken, async (req, res) => {
     const file = await queryOne('SELECT * FROM files WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
     if (!file) return res.status(404).json({ error: 'File not found or unauthorized' });
 
-    const filePath = path.join(uploadDir, file.path);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File physical storage not found' });
-    }
-
     // Increment downloads
     await query('UPDATE files SET download_count = download_count + 1 WHERE id = ?', [file.id]);
     await logActivity(req.user.id, 'FILE_DOWNLOAD', `Downloaded file: ${file.name}`, req);
 
-    res.download(filePath, file.name);
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(file.path);
+      const exists = await blockBlobClient.exists();
+      if (!exists) return res.status(404).json({ error: 'File physical storage not found in Azure' });
+      
+      res.setHeader('Content-Disposition', `attachment; filename="${file.name}"`);
+      res.setHeader('Content-Type', file.type);
+      const downloadResponse = await blockBlobClient.download(0);
+      downloadResponse.readableStreamBody.pipe(res);
+    } else {
+      const filePath = path.join(uploadDir, file.path);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File physical storage not found locally' });
+      }
+      res.download(filePath, file.name);
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -297,13 +347,22 @@ app.get('/api/files/:id/preview', authenticateToken, async (req, res) => {
     const file = await queryOne('SELECT * FROM files WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
     if (!file) return res.status(404).json({ error: 'File not found' });
 
-    const filePath = path.join(uploadDir, file.path);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File physical storage not found' });
-    }
-
     res.setHeader('Content-Type', file.type);
-    res.sendFile(filePath);
+
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(file.path);
+      const exists = await blockBlobClient.exists();
+      if (!exists) return res.status(404).json({ error: 'File physical storage not found in Azure' });
+      
+      const downloadResponse = await blockBlobClient.download(0);
+      downloadResponse.readableStreamBody.pipe(res);
+    } else {
+      const filePath = path.join(uploadDir, file.path);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File physical storage not found locally' });
+      }
+      res.sendFile(filePath);
+    }
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -315,9 +374,12 @@ app.delete('/api/files/:id', authenticateToken, async (req, res) => {
     const file = await queryOne('SELECT * FROM files WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
     if (!file) return res.status(404).json({ error: 'File not found or unauthorized' });
 
-    const filePath = path.join(uploadDir, file.path);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(file.path);
+      await blockBlobClient.deleteIfExists();
+    } else {
+      const filePath = path.join(uploadDir, file.path);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
 
     await query('DELETE FROM files WHERE id = ?', [file.id]);
@@ -471,18 +533,28 @@ app.post('/api/share/public/:id/download', async (req, res) => {
     const file = await queryOne('SELECT * FROM files WHERE id = ?', [link.file_id]);
     if (!file) return res.status(404).json({ error: 'File is missing or deleted' });
 
-    const filePath = path.join(uploadDir, file.path);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File physical storage missing' });
-    }
-
     // Increment downloads count in both link and file tables
     await query('UPDATE share_links SET download_count = download_count + 1 WHERE id = ?', [link.id]);
     await query('UPDATE files SET download_count = download_count + 1 WHERE id = ?', [file.id]);
     
     await logActivity(link.user_id, 'SHARE_LINK_DOWNLOAD', `Anonymous downloaded: ${file.name} via share link`, req);
 
-    res.download(filePath, file.name);
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(file.path);
+      const exists = await blockBlobClient.exists();
+      if (!exists) return res.status(404).json({ error: 'File physical storage missing in Azure' });
+      
+      res.setHeader('Content-Disposition', `attachment; filename="${file.name}"`);
+      res.setHeader('Content-Type', file.type);
+      const downloadResponse = await blockBlobClient.download(0);
+      downloadResponse.readableStreamBody.pipe(res);
+    } else {
+      const filePath = path.join(uploadDir, file.path);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File physical storage missing locally' });
+      }
+      res.download(filePath, file.name);
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Download processing error' });
@@ -549,11 +621,16 @@ app.delete('/api/admin/users/:id', authenticateToken, checkAdmin, async (req, re
   }
 
   try {
-    // Get all user files and delete them from disk
+    // Get all user files and delete them from storage
     const files = await query('SELECT path FROM files WHERE user_id = ?', [targetId]);
     for (const f of files) {
-      const filePath = path.join(uploadDir, f.path);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      if (containerClient) {
+        const blockBlobClient = containerClient.getBlockBlobClient(f.path);
+        await blockBlobClient.deleteIfExists();
+      } else {
+        const filePath = path.join(uploadDir, f.path);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
     }
 
     // Delete db transactions
@@ -575,8 +652,13 @@ app.delete('/api/admin/files/:id', authenticateToken, checkAdmin, async (req, re
     const file = await queryOne('SELECT * FROM files WHERE id = ?', [req.params.id]);
     if (!file) return res.status(404).json({ error: 'File not found' });
 
-    const filePath = path.join(uploadDir, file.path);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    if (containerClient) {
+      const blockBlobClient = containerClient.getBlockBlobClient(file.path);
+      await blockBlobClient.deleteIfExists();
+    } else {
+      const filePath = path.join(uploadDir, file.path);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
 
     await query('DELETE FROM files WHERE id = ?', [file.id]);
     await query('DELETE FROM share_links WHERE file_id = ?', [file.id]);

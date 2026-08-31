@@ -1,0 +1,65 @@
+name: Build and Deploy to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main
+  # Allow manual trigger
+  workflow_dispatch:
+
+env:
+  FRONTEND_IMAGE: cloudvault-frontend
+  BACKEND_IMAGE: cloudvault-backend
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push Backend Image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }} ./backend
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+
+      - name: Build and Push Frontend Image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }} ./frontend
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Backend
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSource: ./backend
+          acrName: ${{ secrets.ACR_NAME }}
+          containerAppName: cloudvault-backend
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+
+      - name: Deploy Frontend
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSource: ./frontend
+          acrName: ${{ secrets.ACR_NAME }}
+          containerAppName: cloudvault-frontend
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
